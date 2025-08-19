@@ -89,7 +89,7 @@
   </div>
 
   <script>
-    /*** Rear camera selection ***/
+    /*** Rear camera selection (unchanged logic) ***/
     async function getRearStream() {
       const base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
       const gum = (extra = {}) =>
@@ -142,20 +142,35 @@
     const canvas = document.getElementById("out");
     const ctx = canvas.getContext("2d", { alpha: false });
 
-    const buf = document.createElement("canvas");
-    const bctx = buf.getContext("2d", { alpha: false });
+    // We downscale capture before buffering to reduce memory.
+    // 1.0 = native, 0.75 = 75% each dimension (~56% pixels), 0.5 = quarter pixels.
+    const CAPTURE_SCALE = 0.75;
 
+    // Keep capture cadence reasonable; too fast = memory spikes.
+    const TARGET_CAPTURE_FPS = 24;
+
+    // If createImageBitmap is flaky, we shrink buffer to be extra safe.
     const supportsRVFC =
       "requestVideoFrameCallback" in HTMLVideoElement.prototype;
     const supportsCreateImageBitmap = "createImageBitmap" in window;
 
-    let fps = 30;
+    // Buffer sizing
+    let measuredFps = TARGET_CAPTURE_FPS;
+    let MAX_BUFFER_SECONDS = 8; // normal
+    if (!supportsCreateImageBitmap) MAX_BUFFER_SECONDS = 3; // conservative fallback
+    let MAX_FRAMES = Math.max(
+      8,
+      Math.floor(MAX_BUFFER_SECONDS * TARGET_CAPTURE_FPS)
+    );
+
+    // State
     let running = false;
-    const frameQueue = [];
+    let slowFactor = 0.5; // controlled by slider
+    let inFlight = 0; // imageBitmap conversions currently in flight
+    let lastCaptureMs = 0;
+    let lastDrawn = null; // last frame to hold on underrun
 
-    let slowFactor = 0.5; // live-controlled by slider
-    const MAX_BUFFER_SECONDS = 8;
-
+    // UI wiring
     const rate = document.getElementById("rate");
     const rateVal = document.getElementById("rateVal");
     rate.addEventListener("input", (e) => {
@@ -163,64 +178,120 @@
       rateVal.textContent = slowFactor.toFixed(2) + "×";
     });
 
+    const buf = document.createElement("canvas");
+    const bctx = buf.getContext("2d", { alpha: false });
+
+    // Ring buffer
+    const frameQueue = [];
+    function clearQueue() {
+      while (frameQueue.length) {
+        const f = frameQueue.shift();
+        if (f && f.close)
+          try {
+            f.close();
+          } catch {}
+      }
+    }
+
     function pushFrame(frame) {
-      const maxFrames = Math.max(1, Math.floor(MAX_BUFFER_SECONDS * fps));
-      if (frameQueue.length >= maxFrames) {
+      if (!running) {
+        if (frame && frame.close) frame.close();
+        return;
+      }
+      if (frameQueue.length >= MAX_FRAMES) {
         const old = frameQueue.shift();
-        if (old && old.close) old.close();
+        if (old && old.close)
+          try {
+            old.close();
+          } catch {}
       }
       frameQueue.push(frame);
     }
 
-    function captureOnce() {
-      if (!src.videoWidth || !src.videoHeight) return;
-      if (buf.width !== src.videoWidth || buf.height !== src.videoHeight) {
-        buf.width = src.videoWidth;
-        buf.height = src.videoHeight;
-      }
-      bctx.drawImage(src, 0, 0, buf.width, buf.height);
+    // Capture one frame with throttling + downscale
+    function captureOnce(nowMs) {
+      if (!running || !src.videoWidth || !src.videoHeight) return;
 
+      const minInterval = 1000 / TARGET_CAPTURE_FPS;
+      if (nowMs - lastCaptureMs < minInterval) return; // throttle capture
+      if (inFlight >= 1) return; // backpressure: only 1 in-flight
+      if (frameQueue.length >= MAX_FRAMES - 1) return; // buffer nearly full → skip
+
+      lastCaptureMs = nowMs;
+      const w = Math.max(2, Math.floor(src.videoWidth * CAPTURE_SCALE));
+      const h = Math.max(2, Math.floor(src.videoHeight * CAPTURE_SCALE));
+      if (buf.width !== w || buf.height !== h) {
+        buf.width = w;
+        buf.height = h;
+      }
+      try {
+        bctx.drawImage(src, 0, 0, w, h);
+      } catch {
+        return;
+      }
+
+      inFlight++;
       if (supportsCreateImageBitmap) {
         createImageBitmap(buf)
-          .then(pushFrame)
+          .then((bmp) => {
+            inFlight--;
+            pushFrame(bmp);
+          })
           .catch(() => {
-            const c = document.createElement("canvas");
-            c.width = buf.width;
-            c.height = buf.height;
-            c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
-            pushFrame(c);
+            inFlight--;
+            // As a last resort, drop this frame.
           });
       } else {
+        // Very conservative fallback: clone into a single pooled canvas object
+        // (avoid creating many canvases per second)
         const c = document.createElement("canvas");
-        c.width = buf.width;
-        c.height = buf.height;
-        c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+        c.width = w;
+        c.height = h;
+        try {
+          c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+        } catch {}
+        inFlight--;
         pushFrame(c);
       }
     }
 
+    // Producer loop
     function scheduleProducer() {
       if (!running) return;
       if (supportsRVFC) {
-        src.requestVideoFrameCallback((now, meta) => {
+        src.requestVideoFrameCallback((_, meta) => {
+          if (!running) return;
           if (meta && meta.mediaTime && meta.presentedFrames) {
             const est = meta.presentedFrames / meta.mediaTime;
-            if (isFinite(est) && est > 0) fps = Math.max(12, Math.min(60, est));
+            if (isFinite(est) && est > 0)
+              measuredFps = Math.max(12, Math.min(60, est));
+            // Keep buffer cap consistent with measured fps
+            MAX_FRAMES = Math.max(
+              8,
+              Math.floor(
+                MAX_BUFFER_SECONDS * Math.min(measuredFps, TARGET_CAPTURE_FPS)
+              )
+            );
           }
-          captureOnce();
+          captureOnce(performance.now());
           scheduleProducer();
         });
       } else {
+        // Timer-based producer
         setTimeout(() => {
-          captureOnce();
+          captureOnce(performance.now());
           scheduleProducer();
-        }, 33);
+        }, Math.max(10, Math.floor(1000 / TARGET_CAPTURE_FPS)));
       }
     }
 
+    // Consumer loop
     function drawLoop() {
       if (!running) return;
-      const frame = frameQueue.shift();
+      let frame = frameQueue.shift();
+      if (frame) lastDrawn = frame;
+      else frame = lastDrawn;
+
       if (frame) {
         const w = frame.width || buf.width;
         const h = frame.height || buf.height;
@@ -228,10 +299,22 @@
           canvas.width = w;
           canvas.height = h;
         }
-        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-        if (frame.close) frame.close();
+        try {
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        } catch {}
+        if (frame !== lastDrawn && frame.close) {
+          // don't close the held frame
+          try {
+            frame.close();
+          } catch {}
+        }
       }
-      setTimeout(drawLoop, 1000 / (fps * slowFactor));
+      // Playback speed control. Clamp to avoid 0ms timers.
+      const playbackFps = Math.max(
+        6,
+        Math.min(60, (measuredFps || TARGET_CAPTURE_FPS) * slowFactor)
+      );
+      setTimeout(drawLoop, Math.max(10, Math.floor(1000 / playbackFps)));
     }
 
     async function startCamera() {
@@ -242,39 +325,58 @@
         running = true;
         scheduleProducer();
         drawLoop();
-        document.getElementById("tapToStart").style.display = "none";
+        const overlay = document.getElementById("tapToStart");
+        if (overlay) overlay.style.display = "none";
       } catch (e) {
         console.error(e);
         // If auto-start is blocked, show a one-tap overlay to satisfy user gesture.
         const overlay = document.getElementById("tapToStart");
-        overlay.style.display = "grid";
-        overlay.onclick = async () => {
-          overlay.textContent = "Requesting camera…";
-          try {
-            await startCamera();
-          } catch (err) {
-            alert(
-              "Camera failed. Ensure HTTPS and allow camera.\n\n" + err.message
-            );
-            overlay.textContent = "Tap to enable camera";
-          }
-        };
+        if (overlay) {
+          overlay.style.display = "grid";
+          overlay.onclick = async () => {
+            overlay.textContent = "Requesting camera…";
+            try {
+              await startCamera();
+            } catch (err) {
+              alert(
+                "Camera failed. Ensure HTTPS and allow camera.\n\n" +
+                  err.message
+              );
+              overlay.textContent = "Tap to enable camera";
+            }
+          };
+        } else {
+          alert(
+            "Camera failed. Ensure HTTPS and allow camera.\n\n" + e.message
+          );
+        }
       }
     }
 
-    // Auto-start on load. Overlay appears only if the browser demands a gesture.
+    // Auto-start; overlay appears only if the browser demands a gesture.
     window.addEventListener("load", startCamera);
 
-    // Optional: pause when hidden (saves battery/heat)
+    // Pause/resume logic
     document.addEventListener("visibilitychange", () => {
-      const shouldRun = !document.hidden;
-      if (shouldRun && !running) {
-        running = true;
-        scheduleProducer();
-        drawLoop();
-      } else if (!shouldRun && running) {
+      if (document.hidden) {
         running = false;
+      } else {
+        if (!running) {
+          running = true;
+          scheduleProducer();
+          drawLoop();
+        }
       }
+    });
+
+    // Clean up on unload (frees camera + memory)
+    window.addEventListener("beforeunload", () => {
+      try {
+        const s = src.srcObject;
+        if (s) s.getTracks().forEach((t) => t.stop());
+      } catch {}
+      clearQueue();
+      running = false;
     });
   </script>
 </body>
