@@ -1,181 +1,79 @@
-hi
-<!DOCTYPE html>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<body
-  style="
-    margin: 0;
-    background: #000;
-    display: grid;
-    place-items: center;
-    height: 100dvh;
-  "
->
-  <!-- Keep the video decoding: don't use display:none -->
-  <video
-    id="src"
-    playsinline
-    muted
-    autoplay
-    style="
-      position: fixed;
-      left: -9999px;
-      top: -9999px;
-      width: 1px;
-      height: 1px;
-      opacity: 0;
-      pointer-events: none;
-    "
-  ></video>
+<script>
+  // ... keep your existing constants and variables ...
 
-  <canvas
-    id="out"
-    style="width: 100vw; height: 100vh; object-fit: cover"
-  ></canvas>
+  async function getRearStream() {
+    const base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+    const gum = (extra = {}) =>
+      navigator.mediaDevices.getUserMedia({
+        video: { ...base, ...extra },
+        audio: false,
+      });
 
-  <button
-    id="start"
-    style="
-      position: fixed;
-      inset: auto 1rem 1rem auto;
-      padding: 0.7rem 1rem;
-      border-radius: 0.7rem;
-    "
-  >
-    Start front camera (0.5×)
-  </button>
+    // 1) Strongest hint
+    try {
+      return await gum({ facingMode: { exact: "environment" } });
+    } catch {}
 
-  <script>
-    const SLOW_FACTOR = 0.5; // playback at half speed
-    const MAX_BUFFER_SECONDS = 8; // keep buffer bounded (memory!)
-    const src = document.getElementById("src");
-    const canvas = document.getElementById("out");
-    const ctx = canvas.getContext("2d", { alpha: false });
+    // 2) Softer hint
+    try {
+      return await gum({ facingMode: { ideal: "environment" } });
+    } catch {}
 
-    // Offscreen buffer we copy the <video> into each frame
-    const buf = document.createElement("canvas");
-    const bctx = buf.getContext("2d", { alpha: false });
+    // 3) Enumerate devices (labels need prior permission on most phones)
+    let tempStream = null;
+    try {
+      tempStream = await gum({ facingMode: { ideal: "user" } });
+    } catch {}
+    let devices = [];
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } finally {
+      if (tempStream) tempStream.getTracks().forEach((t) => t.stop());
+    }
 
-    const supportsRVFC =
-      "requestVideoFrameCallback" in HTMLVideoElement.prototype;
-    const supportsCreateImageBitmap = "createImageBitmap" in window;
-
-    async function start() {
-      document.getElementById("start").style.display = "none";
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: "user" },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        });
-        src.srcObject = stream;
-        await src.play();
-      } catch (e) {
-        console.error(e);
-        alert(
-          "Camera failed. Make sure you’re on HTTPS and allowed camera access.\n\n" +
-            e.message
-        );
-        return;
-      }
-
-      let fps = 30;
-      let running = true;
-      const frameQueue = [];
-
-      function pushFrame(frame) {
-        const maxFrames = Math.max(1, Math.floor(MAX_BUFFER_SECONDS * fps));
-        if (frameQueue.length >= maxFrames) {
-          const old = frameQueue.shift();
-          // Close ImageBitmap to free memory
-          if (old && old.close) old.close();
-        }
-        frameQueue.push(frame);
-      }
-
-      function captureOnce() {
-        if (!src.videoWidth || !src.videoHeight) return; // not ready yet
-        if (buf.width !== src.videoWidth || buf.height !== src.videoHeight) {
-          buf.width = src.videoWidth;
-          buf.height = src.videoHeight;
-        }
-        bctx.drawImage(src, 0, 0, buf.width, buf.height);
-
-        if (supportsCreateImageBitmap) {
-          // Try best path
-          createImageBitmap(buf)
-            .then(pushFrame)
-            .catch(() => {
-              // Fallback: store a canvas copy
-              const c = document.createElement("canvas");
-              c.width = buf.width;
-              c.height = buf.height;
-              c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
-              pushFrame(c);
-            });
-        } else {
-          // Conservative fallback
-          const c = document.createElement("canvas");
-          c.width = buf.width;
-          c.height = buf.height;
-          c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
-          pushFrame(c);
-        }
-      }
-
-      // Producer loop (robust rVFC fallback)
-      function scheduleProducer() {
-        if (!running) return;
-        if (supportsRVFC) {
-          src.requestVideoFrameCallback((now, meta) => {
-            if (meta && meta.mediaTime && meta.presentedFrames) {
-              const est = meta.presentedFrames / meta.mediaTime;
-              if (isFinite(est) && est > 0)
-                fps = Math.max(12, Math.min(60, est));
-            }
-            captureOnce();
-            scheduleProducer();
-          });
-        } else {
-          // Sample at ~30fps if rVFC is missing
-          setTimeout(() => {
-            captureOnce();
-            scheduleProducer();
-          }, 33);
-        }
-      }
-      scheduleProducer();
-
-      // Consumer loop: draw from buffer at slower-than-capture rate
-      (function drawLoop() {
-        if (!running) return;
-        const frame = frameQueue.shift();
-        if (frame) {
-          const w = frame.width || buf.width;
-          const h = frame.height || buf.height;
-          if (canvas.width !== w || canvas.height !== h) {
-            canvas.width = w;
-            canvas.height = h;
-          }
-          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          if (frame.close) frame.close();
-        }
-        setTimeout(drawLoop, 1000 / (fps * SLOW_FACTOR));
-      })();
-
-      // Pause when tab/app is hidden (saves battery)
-      document.addEventListener("visibilitychange", () => {
-        running = !document.hidden;
-        if (running) {
-          scheduleProducer();
-          drawLoop();
-        }
+    const videoIns = devices.filter((d) => d.kind === "videoinput");
+    const rearish = videoIns.find((d) =>
+      /back|rear|environment/i.test(d.label)
+    );
+    if (rearish) {
+      return await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: rearish.deviceId }, ...base },
+        audio: false,
       });
     }
 
-    document.getElementById("start").addEventListener("click", start);
-  </script>
-</body>
+    // 4) Heuristic: last camera is often the back camera
+    if (videoIns.length > 1) {
+      return await navigator.mediaDevices.getUserMedia({
+        video: {
+          deviceId: { exact: videoIns[videoIns.length - 1].deviceId },
+          ...base,
+        },
+        audio: false,
+      });
+    }
+
+    // 5) Final fallback
+    return await gum();
+  }
+
+  async function start() {
+    document.getElementById("start").style.display = "none";
+    try {
+      const stream = await getRearStream();
+      src.srcObject = stream;
+      await src.play();
+    } catch (e) {
+      console.error(e);
+      alert(
+        "Rear camera failed. Check HTTPS & camera permission.\n\n" + e.message
+      );
+      return;
+    }
+
+    // ... keep the rest of your producer/consumer code unchanged ...
+  }
+
+  document.getElementById("start").textContent = "Start rear camera (0.5×)";
+  document.getElementById("start").addEventListener("click", start);
+</script>
