@@ -9,11 +9,28 @@
     height: 100dvh;
   "
 >
-  <video id="src" playsinline muted autoplay style="display: none"></video>
+  <!-- Keep the video decoding: don't use display:none -->
+  <video
+    id="src"
+    playsinline
+    muted
+    autoplay
+    style="
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    "
+  ></video>
+
   <canvas
     id="out"
     style="width: 100vw; height: 100vh; object-fit: cover"
   ></canvas>
+
   <button
     id="start"
     style="
@@ -25,79 +42,139 @@
   >
     Start front camera (0.5×)
   </button>
+
   <script>
-    const SLOW_FACTOR = 0.5; // 0.5× speed (half as fast)
-    const MAX_BUFFER_SECONDS = 12; // cap to avoid huge memory
+    const SLOW_FACTOR = 0.5; // playback at half speed
+    const MAX_BUFFER_SECONDS = 8; // keep buffer bounded (memory!)
     const src = document.getElementById("src");
     const canvas = document.getElementById("out");
     const ctx = canvas.getContext("2d", { alpha: false });
 
+    // Offscreen buffer we copy the <video> into each frame
+    const buf = document.createElement("canvas");
+    const bctx = buf.getContext("2d", { alpha: false });
+
+    const supportsRVFC =
+      "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+    const supportsCreateImageBitmap = "createImageBitmap" in window;
+
     async function start() {
       document.getElementById("start").style.display = "none";
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" },
-        audio: false,
-      });
-      src.srcObject = stream;
-      await src.play();
 
-      // Estimate FPS as we go; start with a sane default
-      let fps = 30;
-      const frameQueue = [];
-      let running = true;
-
-      // Producer: enqueue bitmaps as fast as camera delivers them
-      function pump(_, metadata) {
-        if (!running) return;
-        // Update FPS estimate if metadata is available
-        if (metadata && metadata.mediaTime && metadata.presentedFrames) {
-          const est = metadata.presentedFrames / metadata.mediaTime;
-          if (isFinite(est) && est > 0) fps = Math.max(12, Math.min(60, est));
-        }
-        // Snapshot current frame into an ImageBitmap (cheap copy for drawing later)
-        createImageBitmap(src)
-          .then((bmp) => {
-            const maxFrames = Math.ceil(MAX_BUFFER_SECONDS * fps);
-            if (frameQueue.length >= maxFrames) {
-              // Drop oldest to keep memory bounded; this sets an upper bound on lag.
-              const old = frameQueue.shift();
-              old.close && old.close();
-            }
-            frameQueue.push(bmp);
-            src.requestVideoFrameCallback(pump);
-          })
-          .catch(() => {
-            running = false;
-          });
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "user" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+        src.srcObject = stream;
+        await src.play();
+      } catch (e) {
+        console.error(e);
+        alert(
+          "Camera failed. Make sure you’re on HTTPS and allowed camera access.\n\n" +
+            e.message
+        );
+        return;
       }
-      (
-        src.requestVideoFrameCallback ||
-        function (cb) {
-          // Fallback if rVFC is missing: sample via rAF (~display FPS)
-          function loop(t) {
-            if (!running) return;
-            cb(t, {});
-            requestAnimationFrame(loop);
-          }
-          requestAnimationFrame(loop);
-        }
-      )(pump);
 
-      // Consumer: draw from the queue at slower-than-capture rate
+      let fps = 30;
+      let running = true;
+      const frameQueue = [];
+
+      function pushFrame(frame) {
+        const maxFrames = Math.max(1, Math.floor(MAX_BUFFER_SECONDS * fps));
+        if (frameQueue.length >= maxFrames) {
+          const old = frameQueue.shift();
+          // Close ImageBitmap to free memory
+          if (old && old.close) old.close();
+        }
+        frameQueue.push(frame);
+      }
+
+      function captureOnce() {
+        if (!src.videoWidth || !src.videoHeight) return; // not ready yet
+        if (buf.width !== src.videoWidth || buf.height !== src.videoHeight) {
+          buf.width = src.videoWidth;
+          buf.height = src.videoHeight;
+        }
+        bctx.drawImage(src, 0, 0, buf.width, buf.height);
+
+        if (supportsCreateImageBitmap) {
+          // Try best path
+          createImageBitmap(buf)
+            .then(pushFrame)
+            .catch(() => {
+              // Fallback: store a canvas copy
+              const c = document.createElement("canvas");
+              c.width = buf.width;
+              c.height = buf.height;
+              c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+              pushFrame(c);
+            });
+        } else {
+          // Conservative fallback
+          const c = document.createElement("canvas");
+          c.width = buf.width;
+          c.height = buf.height;
+          c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+          pushFrame(c);
+        }
+      }
+
+      // Producer loop (robust rVFC fallback)
+      function scheduleProducer() {
+        if (!running) return;
+        if (supportsRVFC) {
+          src.requestVideoFrameCallback((now, meta) => {
+            if (meta && meta.mediaTime && meta.presentedFrames) {
+              const est = meta.presentedFrames / meta.mediaTime;
+              if (isFinite(est) && est > 0)
+                fps = Math.max(12, Math.min(60, est));
+            }
+            captureOnce();
+            scheduleProducer();
+          });
+        } else {
+          // Sample at ~30fps if rVFC is missing
+          setTimeout(() => {
+            captureOnce();
+            scheduleProducer();
+          }, 33);
+        }
+      }
+      scheduleProducer();
+
+      // Consumer loop: draw from buffer at slower-than-capture rate
       (function drawLoop() {
         if (!running) return;
-        const bmp = frameQueue.shift();
-        if (bmp) {
-          if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-            canvas.width = bmp.width;
-            canvas.height = bmp.height;
+        const frame = frameQueue.shift();
+        if (frame) {
+          const w = frame.width || buf.width;
+          const h = frame.height || buf.height;
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
           }
-          ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-          bmp.close && bmp.close();
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          if (frame.close) frame.close();
         }
-        setTimeout(drawLoop, 1000 / (fps * SLOW_FACTOR)); // e.g., play 15 fps if capture ~30
+        setTimeout(drawLoop, 1000 / (fps * SLOW_FACTOR));
       })();
+
+      // Pause when tab/app is hidden (saves battery)
+      document.addEventListener("visibilitychange", () => {
+        running = !document.hidden;
+        if (running) {
+          scheduleProducer();
+          drawLoop();
+        }
+      });
     }
+
     document.getElementById("start").addEventListener("click", start);
   </script>
 </body>
