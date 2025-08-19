@@ -236,13 +236,6 @@
       ></video>
     </main>
 
-    <footer>
-      <div class="hint">
-        Tip: Use HTTPS and Safari on iPhone. Slider &lt; 1.0 buffers frames and
-        replays slower (adds latency). Set to 1.00× for near‑live.
-      </div>
-    </footer>
-
     <script>
       (() => {
         const els = {
@@ -513,11 +506,6 @@
             // Recompute display interval against most recent FPS estimate
             displayIntervalMs =
               1000 / Math.max(1, fpsEstimate) / Math.max(0.001, playbackRate);
-            logStatus(
-              `Buffered playback at ${fmt2(
-                playbackRate
-              )}×. Added latency grows as frames accumulate.`
-            );
           }
         }
 
