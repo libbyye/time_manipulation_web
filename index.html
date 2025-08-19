@@ -1,356 +1,170 @@
 <!DOCTYPE html>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<body
-  style="
-    margin: 0;
-    background: #000;
-    display: grid;
-    place-items: center;
-    height: 100dvh;
-    overflow: hidden;
-  "
->
-  <!-- Keep the video decoding: do NOT display:none -->
-  <video
-    id="src"
-    playsinline
-    muted
-    autoplay
-    style="
-      position: fixed;
-      left: -9999px;
-      top: -9999px;
-      width: 1px;
-      height: 1px;
-      opacity: 0;
-      pointer-events: none;
-    "
-  ></video>
-
-  <canvas
-    id="out"
-    style="width: 100vw; height: 100vh; object-fit: cover"
-  ></canvas>
-
-  <!-- Controls -->
-  <div
-    id="controls"
-    style="
-      position: fixed;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      padding: 12px 16px;
-      background: rgba(0, 0, 0, 0.45);
-      backdrop-filter: blur(6px);
+<html lang="en">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
+  <title>Motion-Scaled Camera</title>
+  <style>
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      background: #000;
       color: #fff;
-      font: 500 16px system-ui, -apple-system, Segoe UI, Roboto;
-    "
-  >
-    <label style="display: block; margin: 0 0 6px">
-      Lag rate (playback speed): <span id="rateVal">0.50×</span>
-    </label>
-    <input
-      id="rate"
-      type="range"
-      min="0.20"
-      max="1.00"
-      step="0.05"
-      value="0.50"
-      style="width: 100%"
-    />
-  </div>
-
-  <!-- Only shown if auto-start fails and a user gesture is required -->
-  <div
-    id="tapToStart"
-    style="
-      display: none;
+      font-family: system-ui, sans-serif;
+    }
+    .ui {
+      position: fixed;
+      inset: auto 0 0 0;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 12px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .wrap {
       position: fixed;
       inset: 0;
-      display: grid;
-      place-items: center;
-      background: rgba(0, 0, 0, 0.6);
+      overflow: hidden;
+    }
+    video {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(1.15); /* overscan */
+      will-change: transform;
+      min-width: 100%;
+      min-height: 100%;
+    }
+    input[type="range"] {
+      width: 40vw;
+    }
+    button {
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid #666;
+      background: #111;
       color: #fff;
-      text-align: center;
-      padding: 24px;
-      font: 600 18px system-ui, -apple-system, Segoe UI, Roboto;
-      user-select: none;
-    "
-  >
-    <div>
-      <div style="font-size: 20px; margin-bottom: 8px">
-        Tap to enable camera
-      </div>
-      <div style="opacity: 0.8">
-        Browser blocked auto-start. One tap will grant permission.
-      </div>
-    </div>
+    }
+    .val {
+      min-width: 3ch;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+  <div class="wrap">
+    <video id="v" playsinline muted autoplay></video>
   </div>
-
+  <div class="ui">
+    <button id="start">Start camera</button>
+    <label
+      >Motion scale <span class="val" id="sv">1.00</span>
+      <input
+        id="scale"
+        type="range"
+        min="0.3"
+        max="1.0"
+        step="0.01"
+        value="1.00"
+      />
+    </label>
+  </div>
   <script>
-    /*** Rear camera selection (unchanged) ***/
-    async function getRearStream() {
-      const base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
-      const gum = (extra = {}) =>
-        navigator.mediaDevices.getUserMedia({
-          video: { ...base, ...extra },
-          audio: false,
-        });
+    (async () => {
+      const video = document.getElementById("v");
+      const startBtn = document.getElementById("start");
+      const slider = document.getElementById("scale");
+      const sVal = document.getElementById("sv");
 
-      try {
-        return await gum({ facingMode: { exact: "environment" } });
-      } catch {}
-      try {
-        return await gum({ facingMode: { ideal: "environment" } });
-      } catch {}
+      let baseline = null; // {alpha, beta, gamma}
+      let filtered = { yaw: 0, pitch: 0, roll: 0 };
+      const smooth = 0.12; // low-pass factor (0..1), higher = snappier
+      let scale = 1.0;
 
-      // Enumerate as fallback (needs prior permission on most phones)
-      let tempStream = null;
-      try {
-        tempStream = await gum({ facingMode: { ideal: "user" } });
-      } catch {}
-      let devices = [];
-      try {
-        devices = await navigator.mediaDevices.enumerateDevices();
-      } finally {
-        if (tempStream) tempStream.getTracks().forEach((t) => t.stop());
-      }
+      slider.addEventListener("input", () => {
+        scale = parseFloat(slider.value);
+        sVal.textContent = scale.toFixed(2);
+      });
 
-      const cams = devices.filter((d) => d.kind === "videoinput");
-      const rearish = cams.find((d) => /back|rear|environment/i.test(d.label));
-      if (rearish) {
-        return await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: rearish.deviceId }, ...base },
-          audio: false,
-        });
-      }
-      if (cams.length > 1) {
-        return await navigator.mediaDevices.getUserMedia({
-          video: {
-            deviceId: { exact: cams[cams.length - 1].deviceId },
-            ...base,
-          },
-          audio: false,
-        });
-      }
-      return await gum();
-    }
-
-    /*** App ***/
-    const src = document.getElementById("src");
-    const canvas = document.getElementById("out");
-    const ctx = canvas.getContext("2d", { alpha: false });
-
-    // ---- Live retiming via image-motion queue (no frame lag) ----
-
-    // Small downscaled surface for motion estimation
-    const FLOW_W = 144; // lower = faster; higher = smoother
-    let FLOW_H = 96; // set after we know video aspect
-    const SEARCH_R = 4; // pixels of search radius on flow surface (±R)
-    const STEP = 2; // sample every 'STEP' pixels for speed
-    const ZOOM = 1.2; // overscan so shifts don't show edges
-    const MAX_QUEUE_FRAMES = 900; // safety cap (~15s at 60fps)
-    let speedFactor = 0.5; // slider-controlled: 1.0 normal, 0.5 half-speed
-
-    const rate = document.getElementById("rate");
-    const rateVal = document.getElementById("rateVal");
-    rate.addEventListener("input", (e) => {
-      speedFactor = Number(e.target.value);
-      rateVal.textContent = speedFactor.toFixed(2) + "×";
-    });
-
-    let running = false;
-    let flowC = document.createElement("canvas");
-    let flowCtx = flowC.getContext("2d", { willReadFrequently: true });
-
-    let prevGray = null; // Uint8Array grayscale of previous flow frame
-    let grayA = null,
-      grayB = null; // two buffers we swap into
-    let scaleX = 1,
-      scaleY = 1; // map flow pixels -> video source pixels
-
-    // Motion delta queue and consumer
-    const deltaQ = []; // array of {dx, dy} (flow-space ints)
-    let consumeAcc = 0; // fractional consumer accumulator
-    let dispX = 0,
-      dispY = 0; // source-space pixels applied to draw
-
-    function setupSizes() {
-      const w = src.videoWidth,
-        h = src.videoHeight;
-      if (!w || !h) return false;
-      canvas.width = w;
-      canvas.height = h;
-
-      // Compute flow height keeping aspect
-      FLOW_H = Math.max(16, Math.round((FLOW_W * h) / w));
-      flowC.width = FLOW_W;
-      flowC.height = FLOW_H;
-
-      // flow pixel to source pixel scale
-      scaleX = w / FLOW_W;
-      scaleY = h / FLOW_H;
-
-      // allocate grayscale buffers
-      grayA = new Uint8Array(FLOW_W * FLOW_H);
-      grayB = new Uint8Array(FLOW_W * FLOW_H);
-      prevGray = null;
-      return true;
-    }
-
-    function toGrayscale(dst /*Uint8Array*/) {
-      const id = flowCtx.getImageData(0, 0, FLOW_W, FLOW_H).data;
-      // Integer luma approx: 0.299R + 0.587G + 0.114B ≈ (77R + 150G + 29B) >> 8
-      for (let i = 0, j = 0; i < id.length; i += 4, j++) {
-        dst[j] = (id[i] * 77 + id[i + 1] * 150 + id[i + 2] * 29) >> 8;
-      }
-    }
-
-    function estimateDelta(prev, curr) {
-      // Find dx,dy in [-SEARCH_R, SEARCH_R] that minimize SSD (sum of squared diff)
-      let bestDx = 0,
-        bestDy = 0,
-        bestScore = Infinity;
-      const w = FLOW_W,
-        h = FLOW_H;
-      const r = SEARCH_R,
-        step = STEP;
-      // Avoid borders by r to keep indices valid
-      for (let dy = -r; dy <= r; dy++) {
-        for (let dx = -r; dx <= r; dx++) {
-          let sum = 0,
-            cnt = 0;
-          for (let y = r; y < h - r; y += step) {
-            const y0 = y * w;
-            const y1 = (y + dy) * w;
-            for (let x = r; x < w - r; x += step) {
-              const i0 = y0 + x;
-              const i1 = y1 + (x + dx);
-              const d = curr[i1] - prev[i0];
-              sum += d * d;
-              cnt++;
-            }
-          }
-          // Normalize by cnt to reduce bias (optional)
-          const score = sum / (cnt || 1);
-          if (score < bestScore) {
-            bestScore = score;
-            bestDx = dx;
-            bestDy = dy;
+      async function requestMotionPermIfNeeded() {
+        const iOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const permNeeded =
+          iOS &&
+          typeof DeviceMotionEvent !== "undefined" &&
+          typeof DeviceMotionEvent.requestPermission === "function";
+        if (permNeeded) {
+          try {
+            const res = await DeviceMotionEvent.requestPermission();
+            if (res !== "granted") throw new Error("Motion permission denied");
+          } catch (e) {
+            console.warn(e);
           }
         }
       }
-      // Clamp crazy jumps (optional, already bounded by SEARCH_R)
-      return { dx: bestDx, dy: bestDy };
-    }
 
-    function drawFrame() {
-      if (!running) return;
-
-      const w = src.videoWidth || 0,
-        h = src.videoHeight || 0;
-      if (!w || !h) {
-        if ("requestVideoFrameCallback" in HTMLVideoElement.prototype)
-          src.requestVideoFrameCallback(() => drawFrame());
-        else requestAnimationFrame(drawFrame);
-        return;
-      }
-
-      // One-time setup when dimensions appear
-      if (canvas.width !== w || canvas.height !== h || flowC.width !== FLOW_W) {
-        setupSizes();
-      }
-
-      // Produce motion delta (flow)
-      try {
-        flowCtx.drawImage(src, 0, 0, FLOW_W, FLOW_H);
-        // compute grayscale into grayA/grayB buffers, swap each frame
-        const curr = prevGray === grayA || prevGray === null ? grayB : grayA;
-        toGrayscale(curr);
-
-        if (prevGray) {
-          const { dx, dy } = estimateDelta(prevGray, curr);
-          // Push new delta; cap queue length
-          if (deltaQ.length >= MAX_QUEUE_FRAMES) deltaQ.shift();
-          deltaQ.push({ dx, dy });
+      async function start() {
+        await requestMotionPermIfNeeded();
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" } },
+            audio: false,
+          });
+          video.srcObject = stream;
+          await video.play();
+          startBtn.disabled = true;
+          startBtn.textContent = "Running";
+        } catch (e) {
+          alert("Camera error: " + e.message);
+          return;
         }
-        prevGray = curr;
-      } catch (_) {
-        // ignore sporadic read errors
-      }
 
-      // Consume deltas at speedFactor of production
-      consumeAcc += speedFactor;
-      while (consumeAcc >= 1 && deltaQ.length) {
-        const { dx, dy } = deltaQ.shift();
-        dispX += dx * scaleX;
-        dispY += dy * scaleY;
-        consumeAcc -= 1;
-      }
+        window.addEventListener("deviceorientation", (ev) => {
+          // ev.alpha (z), ev.beta (x), ev.gamma (y) in degrees; may be null on some devices
+          if (ev.alpha == null || ev.beta == null || ev.gamma == null) return;
+          const a = (ev.alpha * Math.PI) / 180; // yaw-ish
+          const b = (ev.beta * Math.PI) / 180; // pitch-ish
+          const g = (ev.gamma * Math.PI) / 180; // roll-ish (screen axes)
+          if (!baseline) baseline = { a, b, g };
 
-      // Clamp transform to zoom margins
-      const marginX = (ZOOM - 1) * w * 0.5;
-      const marginY = (ZOOM - 1) * h * 0.5;
-      if (dispX > marginX) dispX = marginX;
-      if (dispX < -marginX) dispX = -marginX;
-      if (dispY > marginY) dispY = marginY;
-      if (dispY < -marginY) dispY = -marginY;
+          // deltas from baseline
+          const yaw = wrap(a - baseline.a);
+          const pitch = b - baseline.b;
+          const roll = g - baseline.g;
 
-      // Draw current live frame with slowed transform applied
-      try {
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.drawImage(
-          src,
-          -marginX + dispX,
-          -marginY + dispY,
-          w * ZOOM,
-          h * ZOOM
-        );
-      } catch {}
+          // simple low-pass filter
+          filtered.yaw += (yaw - filtered.yaw) * smooth;
+          filtered.pitch += (pitch - filtered.pitch) * smooth;
+          filtered.roll += (roll - filtered.roll) * smooth;
+        });
 
-      if ("requestVideoFrameCallback" in HTMLVideoElement.prototype)
-        src.requestVideoFrameCallback(() => drawFrame());
-      else requestAnimationFrame(drawFrame);
-    }
-
-    async function startAll() {
-      try {
-        const stream = await getRearStream();
-        src.srcObject = stream;
-        await src.play();
-        running = true;
-        const overlay = document.getElementById("tapToStart");
-        if (overlay) overlay.style.display = "none";
-        drawFrame();
-      } catch (e) {
-        console.error(e);
-        const overlay = document.getElementById("tapToStart");
-        if (overlay) {
-          overlay.style.display = "grid";
-          overlay.onclick = () => location.reload();
-        } else {
-          alert(
-            "Camera failed. Ensure HTTPS and allow camera.\n\n" + e.message
-          );
+        function wrap(r) {
+          // wrap to [-PI, PI]
+          const PI = Math.PI;
+          return ((r + PI) % (2 * PI)) - PI;
         }
+
+        function render() {
+          // compensation factor
+          const c = 1 - scale;
+
+          // Map radians to pixels: rough heuristic using ~60° horizontal FOV
+          const w = window.innerWidth;
+          const h = window.innerHeight;
+          const pxPerRadX = w / (Math.PI / 3); // ~60° = PI/3
+          const pxPerRadY = h / (Math.PI / 3);
+
+          const tx = -c * filtered.yaw * pxPerRadX; // negative to counter-move
+          const ty = c * filtered.pitch * pxPerRadY; // pitch sign feels better positive
+          const rZ = -c * filtered.roll;
+
+          video.style.transform = `translate(calc(-50% + ${tx}px), calc(-50% + ${ty}px)) rotate(${rZ}rad) scale(1.15)`;
+          requestAnimationFrame(render);
+        }
+        requestAnimationFrame(render);
       }
-    }
 
-    window.addEventListener("load", startAll);
-
-    // Pause/resume
-    document.addEventListener("visibilitychange", () => {
-      running = !document.hidden;
-      if (running) drawFrame();
-    });
-
-    // Cleanup
-    window.addEventListener("beforeunload", () => {
-      try {
-        const s = src.srcObject;
-        if (s) s.getTracks().forEach((t) => t.stop());
-      } catch {}
-    });
+      startBtn.addEventListener("click", start, { once: true });
+    })();
   </script>
-</body>
+</html>
