@@ -1,79 +1,280 @@
-<script>
-  // ... keep your existing constants and variables ...
+<!DOCTYPE html>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<body
+  style="
+    margin: 0;
+    background: #000;
+    display: grid;
+    place-items: center;
+    height: 100dvh;
+    overflow: hidden;
+  "
+>
+  <!-- Keep the video decoding: do NOT display:none -->
+  <video
+    id="src"
+    playsinline
+    muted
+    autoplay
+    style="
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    "
+  ></video>
 
-  async function getRearStream() {
-    const base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
-    const gum = (extra = {}) =>
-      navigator.mediaDevices.getUserMedia({
-        video: { ...base, ...extra },
-        audio: false,
-      });
+  <canvas
+    id="out"
+    style="width: 100vw; height: 100vh; object-fit: cover"
+  ></canvas>
 
-    // 1) Strongest hint
-    try {
-      return await gum({ facingMode: { exact: "environment" } });
-    } catch {}
+  <!-- Controls -->
+  <div
+    id="controls"
+    style="
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding: 12px 16px;
+      background: rgba(0, 0, 0, 0.45);
+      backdrop-filter: blur(6px);
+      color: #fff;
+      font: 500 16px system-ui, -apple-system, Segoe UI, Roboto;
+    "
+  >
+    <label style="display: block; margin: 0 0 6px">
+      Lag rate (playback speed): <span id="rateVal">0.50×</span>
+    </label>
+    <input
+      id="rate"
+      type="range"
+      min="0.20"
+      max="1.00"
+      step="0.05"
+      value="0.50"
+      style="width: 100%"
+    />
+  </div>
 
-    // 2) Softer hint
-    try {
-      return await gum({ facingMode: { ideal: "environment" } });
-    } catch {}
+  <!-- Only shown if auto-start fails and a user gesture is required -->
+  <div
+    id="tapToStart"
+    style="
+      display: none;
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background: rgba(0, 0, 0, 0.6);
+      color: #fff;
+      text-align: center;
+      padding: 24px;
+      font: 600 18px system-ui, -apple-system, Segoe UI, Roboto;
+      user-select: none;
+    "
+  >
+    <div>
+      <div style="font-size: 20px; margin-bottom: 8px">
+        Tap to enable camera
+      </div>
+      <div style="opacity: 0.8">
+        Browser blocked auto-start. One tap will grant permission.
+      </div>
+    </div>
+  </div>
 
-    // 3) Enumerate devices (labels need prior permission on most phones)
-    let tempStream = null;
-    try {
-      tempStream = await gum({ facingMode: { ideal: "user" } });
-    } catch {}
-    let devices = [];
-    try {
-      devices = await navigator.mediaDevices.enumerateDevices();
-    } finally {
-      if (tempStream) tempStream.getTracks().forEach((t) => t.stop());
+  <script>
+    /*** Rear camera selection ***/
+    async function getRearStream() {
+      const base = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+      const gum = (extra = {}) =>
+        navigator.mediaDevices.getUserMedia({
+          video: { ...base, ...extra },
+          audio: false,
+        });
+
+      try {
+        return await gum({ facingMode: { exact: "environment" } });
+      } catch {}
+      try {
+        return await gum({ facingMode: { ideal: "environment" } });
+      } catch {}
+
+      // Enumerate as fallback (needs prior permission on most phones)
+      let tempStream = null;
+      try {
+        tempStream = await gum({ facingMode: { ideal: "user" } });
+      } catch {}
+      let devices = [];
+      try {
+        devices = await navigator.mediaDevices.enumerateDevices();
+      } finally {
+        if (tempStream) tempStream.getTracks().forEach((t) => t.stop());
+      }
+
+      const cams = devices.filter((d) => d.kind === "videoinput");
+      const rearish = cams.find((d) => /back|rear|environment/i.test(d.label));
+      if (rearish) {
+        return await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: { exact: rearish.deviceId }, ...base },
+          audio: false,
+        });
+      }
+      if (cams.length > 1) {
+        return await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: { exact: cams[cams.length - 1].deviceId },
+            ...base,
+          },
+          audio: false,
+        });
+      }
+      return await gum();
     }
 
-    const videoIns = devices.filter((d) => d.kind === "videoinput");
-    const rearish = videoIns.find((d) =>
-      /back|rear|environment/i.test(d.label)
-    );
-    if (rearish) {
-      return await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: rearish.deviceId }, ...base },
-        audio: false,
-      });
+    /*** App ***/
+    const src = document.getElementById("src");
+    const canvas = document.getElementById("out");
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    const buf = document.createElement("canvas");
+    const bctx = buf.getContext("2d", { alpha: false });
+
+    const supportsRVFC =
+      "requestVideoFrameCallback" in HTMLVideoElement.prototype;
+    const supportsCreateImageBitmap = "createImageBitmap" in window;
+
+    let fps = 30;
+    let running = false;
+    const frameQueue = [];
+
+    let slowFactor = 0.5; // live-controlled by slider
+    const MAX_BUFFER_SECONDS = 8;
+
+    const rate = document.getElementById("rate");
+    const rateVal = document.getElementById("rateVal");
+    rate.addEventListener("input", (e) => {
+      slowFactor = Number(e.target.value);
+      rateVal.textContent = slowFactor.toFixed(2) + "×";
+    });
+
+    function pushFrame(frame) {
+      const maxFrames = Math.max(1, Math.floor(MAX_BUFFER_SECONDS * fps));
+      if (frameQueue.length >= maxFrames) {
+        const old = frameQueue.shift();
+        if (old && old.close) old.close();
+      }
+      frameQueue.push(frame);
     }
 
-    // 4) Heuristic: last camera is often the back camera
-    if (videoIns.length > 1) {
-      return await navigator.mediaDevices.getUserMedia({
-        video: {
-          deviceId: { exact: videoIns[videoIns.length - 1].deviceId },
-          ...base,
-        },
-        audio: false,
-      });
+    function captureOnce() {
+      if (!src.videoWidth || !src.videoHeight) return;
+      if (buf.width !== src.videoWidth || buf.height !== src.videoHeight) {
+        buf.width = src.videoWidth;
+        buf.height = src.videoHeight;
+      }
+      bctx.drawImage(src, 0, 0, buf.width, buf.height);
+
+      if (supportsCreateImageBitmap) {
+        createImageBitmap(buf)
+          .then(pushFrame)
+          .catch(() => {
+            const c = document.createElement("canvas");
+            c.width = buf.width;
+            c.height = buf.height;
+            c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+            pushFrame(c);
+          });
+      } else {
+        const c = document.createElement("canvas");
+        c.width = buf.width;
+        c.height = buf.height;
+        c.getContext("2d", { alpha: false }).drawImage(buf, 0, 0);
+        pushFrame(c);
+      }
     }
 
-    // 5) Final fallback
-    return await gum();
-  }
-
-  async function start() {
-    document.getElementById("start").style.display = "none";
-    try {
-      const stream = await getRearStream();
-      src.srcObject = stream;
-      await src.play();
-    } catch (e) {
-      console.error(e);
-      alert(
-        "Rear camera failed. Check HTTPS & camera permission.\n\n" + e.message
-      );
-      return;
+    function scheduleProducer() {
+      if (!running) return;
+      if (supportsRVFC) {
+        src.requestVideoFrameCallback((now, meta) => {
+          if (meta && meta.mediaTime && meta.presentedFrames) {
+            const est = meta.presentedFrames / meta.mediaTime;
+            if (isFinite(est) && est > 0) fps = Math.max(12, Math.min(60, est));
+          }
+          captureOnce();
+          scheduleProducer();
+        });
+      } else {
+        setTimeout(() => {
+          captureOnce();
+          scheduleProducer();
+        }, 33);
+      }
     }
 
-    // ... keep the rest of your producer/consumer code unchanged ...
-  }
+    function drawLoop() {
+      if (!running) return;
+      const frame = frameQueue.shift();
+      if (frame) {
+        const w = frame.width || buf.width;
+        const h = frame.height || buf.height;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        if (frame.close) frame.close();
+      }
+      setTimeout(drawLoop, 1000 / (fps * slowFactor));
+    }
 
-  document.getElementById("start").textContent = "Start rear camera (0.5×)";
-  document.getElementById("start").addEventListener("click", start);
-</script>
+    async function startCamera() {
+      try {
+        const stream = await getRearStream();
+        src.srcObject = stream;
+        await src.play();
+        running = true;
+        scheduleProducer();
+        drawLoop();
+        document.getElementById("tapToStart").style.display = "none";
+      } catch (e) {
+        console.error(e);
+        // If auto-start is blocked, show a one-tap overlay to satisfy user gesture.
+        const overlay = document.getElementById("tapToStart");
+        overlay.style.display = "grid";
+        overlay.onclick = async () => {
+          overlay.textContent = "Requesting camera…";
+          try {
+            await startCamera();
+          } catch (err) {
+            alert(
+              "Camera failed. Ensure HTTPS and allow camera.\n\n" + err.message
+            );
+            overlay.textContent = "Tap to enable camera";
+          }
+        };
+      }
+    }
+
+    // Auto-start on load. Overlay appears only if the browser demands a gesture.
+    window.addEventListener("load", startCamera);
+
+    // Optional: pause when hidden (saves battery/heat)
+    document.addEventListener("visibilitychange", () => {
+      const shouldRun = !document.hidden;
+      if (shouldRun && !running) {
+        running = true;
+        scheduleProducer();
+        drawLoop();
+      } else if (!shouldRun && running) {
+        running = false;
+      }
+    });
+  </script>
+</body>
