@@ -1,201 +1,425 @@
 <!DOCTYPE html>
 <html lang="en">
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Motion-Scaled Camera</title>
-  <style>
-    :root {
-      color-scheme: dark;
-    }
-    body {
-      margin: 0;
-      font-family: system-ui, sans-serif;
-      background: #000;
-      color: #fff;
-    }
-    main {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      padding: 12px;
-      align-items: center;
-    }
-    .stage {
-      position: relative;
-      width: 100vw;
-      height: calc(100vh - 170px);
-      overflow: hidden;
-      background: #000;
-      border-radius: 16px;
-    }
-    /* We translate this wrapper in px while the video itself is scaled for “margin” */
-    .view {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      will-change: transform;
-    }
-    video {
-      display: block;
-      width: 100vw;
-      height: calc(100vh - 170px);
-      object-fit: cover;
-      transform-origin: center center;
-      will-change: transform;
-    }
-    .controls {
-      width: 100%;
-      max-width: 600px;
-      display: grid;
-      gap: 8px;
-    }
-    input[type="range"] {
-      width: 100%;
-    }
-    button {
-      padding: 10px 14px;
-      border-radius: 10px;
-      border: 0;
-      background: #1f6feb;
-      color: #fff;
-      font-weight: 600;
-    }
-    .row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-    }
-    .hint {
-      opacity: 0.7;
-      font-size: 0.9rem;
-    }
-  </style>
-  <main>
-    <div class="stage" id="stage">
-      <div class="view" id="view">
-        <video id="cam" autoplay playsinline muted></video>
-      </div>
-    </div>
-
-    <div class="controls">
-      <div class="row">
-        <label>Motion scale (k): <strong id="kOut">1.00</strong></label>
-        <button id="start">Start</button>
-      </div>
-      <input
-        id="k"
-        type="range"
-        min="0.30"
-        max="1.00"
-        step="0.01"
-        value="1.00"
-      />
-      <div class="hint">
-        Tip: k=1.00 shows the raw camera. Lower k reduces perceived motion
-        (requires extra zoom).
-      </div>
-      <div id="status" class="hint"></div>
-    </div>
-  </main>
-
-  <script>
-    (async function () {
-      const video = document.getElementById("cam");
-      const view = document.getElementById("view");
-      const stage = document.getElementById("stage");
-      const startBtn = document.getElementById("start");
-      const kSlider = document.getElementById("k");
-      const kOut = document.getElementById("kOut");
-      const status = document.getElementById("status");
-
-      let k = parseFloat(kSlider.value); // user scale factor (0.3–1.0)
-      let scale = 1.25; // zoom to give us margin for counter-pan
-      let baseline = null; // {beta, gamma}
-      let pxPerDegX, pxPerDegY; // sensitivity (px per degree)
-      let maxX, maxY; // clamps based on zoom & viewport
-
-      function updateMetrics() {
-        // map ~45° tilt to near full-width/height of the stage
-        pxPerDegX = stage.clientWidth / 45;
-        pxPerDegY = stage.clientHeight / 45;
-        maxX = ((scale - 1) * stage.clientWidth) / 2;
-        maxY = ((scale - 1) * stage.clientHeight) / 2;
-        video.style.transform = `scale(${scale})`;
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Live Camera Slow‑Mo (iPhone)</title>
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --fg: #eef2f6;
+        --muted: #aab4c2;
+        --accent: #66c2ff;
       }
-      updateMetrics();
-      window.addEventListener("resize", updateMetrics);
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
+          Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
+      }
+      .app {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        grid-template-rows: 1fr auto;
+      }
+      /* Video is hidden; we draw to canvas for timing control */
+      video {
+        display: none;
+      }
+      canvas {
+        width: 100vw;
+        height: 100vh;
+        background: #000;
+      }
 
-      kSlider.addEventListener("input", () => {
-        k = parseFloat(kSlider.value);
-        kOut.textContent = k.toFixed(2);
-      });
+      .controls {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding: env(safe-area-inset-bottom) 16px 16px 16px;
+        background: linear-gradient(
+          180deg,
+          rgba(0, 0, 0, 0) 0%,
+          rgba(0, 0, 0, 0.55) 20%,
+          rgba(0, 0, 0, 0.7) 100%
+        );
+        display: grid;
+        gap: 10px;
+        justify-items: center;
+        align-items: center;
+      }
+      .panel {
+        width: min(680px, 96vw);
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 16px;
+        padding: 12px 14px;
+        backdrop-filter: blur(8px);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 14px;
+        align-items: center;
+      }
+      label {
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .value {
+        font-variant-numeric: tabular-nums;
+        min-width: 3.2ch;
+        text-align: right;
+      }
 
-      async function startCamera() {
-        status.textContent = "Requesting camera...";
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
-          audio: false,
+      input[type="range"] {
+        width: 100%;
+        height: 32px;
+        -webkit-appearance: none;
+        background: transparent;
+      }
+      input[type="range"]::-webkit-slider-runnable-track {
+        height: 6px;
+        background: rgba(255, 255, 255, 0.24);
+        border-radius: 999px;
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 24px;
+        height: 24px;
+        margin-top: -9px;
+        background: var(--accent);
+        border-radius: 50%;
+        box-shadow: 0 2px 10px rgba(102, 194, 255, 0.6);
+        border: 0;
+      }
+      .buttons {
+        display: grid;
+        grid-auto-flow: column;
+        gap: 8px;
+        justify-content: center;
+      }
+      button {
+        appearance: none;
+        -webkit-appearance: none;
+        background: #121820;
+        color: var(--fg);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        padding: 10px 14px;
+        border-radius: 12px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #051521;
+        border-color: transparent;
+      }
+      .status {
+        text-align: center;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .tip {
+        text-align: center;
+        font-size: 12px;
+        color: var(--muted);
+        opacity: 0.9;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app" id="app">
+      <video id="video" playsinline muted></video>
+      <canvas
+        id="canvas"
+        width="1280"
+        height="720"
+        aria-label="Camera canvas"
+      ></canvas>
+
+      <div class="controls">
+        <div class="panel" role="group" aria-label="Controls">
+          <div class="row" style="margin-bottom: 6px">
+            <label for="speed">Playback speed (relative to live)</label>
+            <div class="value"><span id="speedVal">1.00</span>×</div>
+          </div>
+          <input
+            id="speed"
+            type="range"
+            min="0.30"
+            max="1.00"
+            step="0.01"
+            value="1.00"
+            aria-valuemin="0.30"
+            aria-valuemax="1.00"
+            aria-valuenow="1.00"
+          />
+          <div class="buttons" style="margin-top: 10px">
+            <button id="startBtn" class="primary">Start Camera</button>
+            <button id="stopBtn">Stop</button>
+          </div>
+          <div class="status" id="status">Idle</div>
+          <div class="tip">
+            Tip: Slower speeds introduce delay because frames are buffered and
+            replayed. Use HTTPS and grant camera permission.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      (() => {
+        "use strict";
+
+        const video = document.getElementById("video");
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d", {
+          alpha: false,
+          desynchronized: true,
         });
-        video.srcObject = stream;
-        await video.play();
-      }
 
-      async function startMotion() {
-        // iOS requires a permission request in a user gesture
-        try {
-          if (
-            window.DeviceOrientationEvent &&
-            typeof DeviceOrientationEvent.requestPermission === "function"
-          ) {
-            const resp = await DeviceOrientationEvent.requestPermission();
-            if (resp !== "granted") throw new Error("Motion permission denied");
+        const speedSlider = document.getElementById("speed");
+        const speedVal = document.getElementById("speedVal");
+        const statusEl = document.getElementById("status");
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
+
+        const state = {
+          stream: null,
+          running: false,
+          fps: 30,
+          speed: 1.0,
+          frames: [], // recent frames (ImageBitmap or ImageData)
+          maxBufferSeconds: 5, // up to ~5 seconds of buffer
+          get maxFrames() {
+            return Math.max(30, Math.floor(this.fps * this.maxBufferSeconds));
+          },
+          playIndex: 0,
+          accumulator: 0,
+          lastRender: performance.now(),
+          captureTimer: null,
+          useVFCB: !!HTMLVideoElement.prototype.requestVideoFrameCallback,
+        };
+
+        function setStatus(msg) {
+          statusEl.textContent = msg;
+        }
+
+        function updateCanvasSize() {
+          const vw = Math.max(320, video.videoWidth || 1280);
+          const vh = Math.max(240, video.videoHeight || 720);
+          canvas.width = vw;
+          canvas.height = vh;
+        }
+
+        async function start() {
+          if (!navigator.mediaDevices?.getUserMedia) {
+            alert("getUserMedia is not supported on this device/browser.");
+            return;
           }
-        } catch (e) {
-          // Some browsers don’t implement requestPermission; ignore here
+          try {
+            const constraints = {
+              video: {
+                facingMode: { ideal: "environment" },
+                frameRate: { ideal: 30, max: 30 },
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+              },
+              audio: false,
+            };
+            const stream = await navigator.mediaDevices.getUserMedia(
+              constraints
+            );
+            state.stream = stream;
+            video.srcObject = stream;
+            await video.play();
+            updateCanvasSize();
+            state.running = true;
+            state.frames.length = 0;
+            state.playIndex = 0;
+            state.lastRender = performance.now();
+            setStatus("Camera running");
+
+            if (state.useVFCB) {
+              video.requestVideoFrameCallback(captureWithVFCB);
+            } else {
+              // Fallback capture loop ~30fps
+              state.captureTimer = setInterval(
+                captureFallback,
+                Math.round(1000 / state.fps)
+              );
+            }
+            requestAnimationFrame(renderLoop);
+          } catch (err) {
+            console.error(err);
+            alert("Could not start camera: " + (err?.message || err));
+            setStatus("Error starting camera");
+          }
         }
 
-        baseline = null;
-        window.addEventListener("deviceorientation", handleOrientation, {
-          passive: true,
+        function stop() {
+          state.running = false;
+          if (state.captureTimer) clearInterval(state.captureTimer);
+          if (state.stream) {
+            for (const track of state.stream.getTracks()) track.stop();
+            state.stream = null;
+          }
+          setStatus("Stopped");
+        }
+
+        async function captureWithVFCB(now, metadata) {
+          if (!state.running) return;
+          try {
+            // Grab a snapshot of the current frame as an ImageBitmap, scaled to canvas size
+            const bmp = await createImageBitmap(video, {
+              resizeWidth: canvas.width,
+              resizeHeight: canvas.height,
+              resizeQuality: "low",
+            });
+            state.frames.push(bmp);
+            trimBuffer();
+          } catch (e) {
+            // If createImageBitmap fails intermittently, skip the frame
+            // (This can happen under memory pressure on mobile.)
+          } finally {
+            if (state.running) video.requestVideoFrameCallback(captureWithVFCB);
+          }
+        }
+
+        // Fallback capture that draws to an offscreen canvas first
+        const offscreen = document.createElement("canvas");
+        const offCtx = offscreen.getContext("2d", { alpha: false });
+        function captureFallback() {
+          if (!state.running) return;
+          offscreen.width = canvas.width;
+          offscreen.height = canvas.height;
+          offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+          if (window.createImageBitmap) {
+            createImageBitmap(offscreen)
+              .then((bmp) => {
+                state.frames.push(bmp);
+                trimBuffer();
+              })
+              .catch(() => {
+                /* swallow */
+              });
+          } else {
+            // Last-resort: store ImageData (heavier on memory)
+            const imgData = offCtx.getImageData(
+              0,
+              0,
+              offscreen.width,
+              offscreen.height
+            );
+            state.frames.push(imgData);
+            trimBuffer();
+          }
+        }
+
+        function trimBuffer() {
+          // Enforce max buffer and keep playIndex aligned when frames drop off the front
+          while (state.frames.length > state.maxFrames) {
+            const dropped = state.frames.shift();
+            if (dropped && dropped.close)
+              try {
+                dropped.close();
+              } catch {}
+            if (state.playIndex > 0) state.playIndex--; // maintain relative position
+          }
+        }
+
+        function drawFrame(frame) {
+          if (!frame) return;
+          if ("data" in frame) {
+            ctx.putImageData(frame, 0, 0);
+          } else {
+            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          }
+        }
+
+        function renderLoop(t) {
+          if (!state.running) return;
+          const dt = Math.max(0, (t - state.lastRender) / 1000);
+          state.lastRender = t;
+
+          if (state.speed >= 0.99 || state.frames.length === 0) {
+            // Near-"live": draw current camera frame directly to minimize latency
+            try {
+              ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            } catch {}
+            // Keep playIndex near the tail so if user slows down, we have recent frames
+            state.playIndex = state.frames.length - 1;
+          } else {
+            // Slow motion: advance playIndex more slowly than new frames arrive
+            state.accumulator += state.speed * state.fps * dt; // frames worth of time
+            while (state.accumulator >= 1) {
+              state.playIndex = Math.min(
+                state.playIndex + 1,
+                state.frames.length - 1
+              );
+              state.accumulator -= 1;
+            }
+            drawFrame(state.frames[state.playIndex]);
+
+            // If we fall too far behind (buffer almost full), jump forward to reduce latency
+            const maxLagFrames = Math.floor(state.maxFrames * 0.9);
+            const lag = state.frames.length - 1 - state.playIndex;
+            if (lag > maxLagFrames) {
+              state.playIndex = state.frames.length - 1 - maxLagFrames;
+              state.accumulator = 0;
+            }
+          }
+
+          requestAnimationFrame(renderLoop);
+        }
+
+        // UI wiring
+        speedSlider.addEventListener("input", (e) => {
+          state.speed = parseFloat(e.target.value);
+          speedVal.textContent = state.speed.toFixed(2);
+          speedSlider.setAttribute("aria-valuenow", state.speed.toFixed(2));
+          if (state.speed >= 0.99) {
+            // Snap back near live when going to 1.0 speed
+            state.playIndex = state.frames.length - 1;
+          }
         });
-      }
 
-      function handleOrientation(e) {
-        if (e.beta == null || e.gamma == null) return; // not supported
-        if (!baseline) baseline = { beta: e.beta, gamma: e.gamma };
+        startBtn.addEventListener("click", start);
+        stopBtn.addEventListener("click", stop);
 
-        // delta from baseline
-        let dBeta = e.beta - baseline.beta; // front-back tilt (up/down)
-        let dGamma = e.gamma - baseline.gamma; // left-right tilt (pan)
+        // Pause capture when backgrounded to conserve resources on iOS
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) {
+            // Note: we intentionally do not stop the stream; just pause rendering
+            state.running = false;
+            setStatus("Paused");
+          } else if (video.srcObject) {
+            state.lastRender = performance.now();
+            state.running = true;
+            requestAnimationFrame(renderLoop);
+            setStatus("Camera running");
+          }
+        });
 
-        // Counter-move the view by (1 - k) * delta
-        let offX = -(1 - k) * dGamma * pxPerDegX;
-        let offY = (1 - k) * dBeta * pxPerDegY;
-
-        // clamp to avoid exposing edges
-        offX = Math.max(-maxX, Math.min(maxX, offX));
-        offY = Math.max(-maxY, Math.min(maxY, offY));
-
-        // translate from center, then apply px offset
-        view.style.transform = `translate(-50%,-50%) translate(${offX.toFixed(
-          1
-        )}px, ${offY.toFixed(1)}px)`;
-      }
-
-      startBtn.addEventListener("click", async () => {
-        startBtn.disabled = true;
-        try {
-          if (!("mediaDevices" in navigator))
-            throw new Error("No mediaDevices API");
-          await startCamera();
-          await startMotion();
-          status.textContent = "Running. Move your phone and adjust k.";
-        } catch (err) {
-          status.textContent = "Error: " + err.message;
-          startBtn.disabled = false;
-        }
-      });
-    })();
-  </script>
+        // Resize canvas if the video metadata changes (orientation switch etc.)
+        video.addEventListener("loadedmetadata", updateCanvasSize);
+        window.addEventListener("orientationchange", () =>
+          setTimeout(updateCanvasSize, 300)
+        );
+      })();
+    </script>
+  </body>
 </html>
