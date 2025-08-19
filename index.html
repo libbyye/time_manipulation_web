@@ -87,6 +87,7 @@
       </div>
     </div>
   </div>
+
   <script>
     /*** Rear camera selection (unchanged) ***/
     async function getRearStream() {
@@ -141,16 +142,17 @@
     const canvas = document.getElementById("out");
     const ctx = canvas.getContext("2d", { alpha: false });
 
-    /* === Motion-speed scaler (no lag) ==========================================
-   We always draw the latest frame, but shift the drawn image opposite to
-   device rotation so the apparent motion is scaled by `speedFactor`.
-   -------------------------------------------------------------------------- */
-    const H_FOV_DEG = 60; // Approx phone horizontal field-of-view (tweak per device)
-    const V_FOV_DEG = 45; // Approx vertical FOV (tweak per device)
-    const ZOOM = 1.2; // Overscan to hide edges while we shift (1.0 .. 1.3 typical)
+    // ---- Live retiming via image-motion queue (no frame lag) ----
 
-    let running = false;
-    let speedFactor = 0.5; // from slider: 1.0 = normal, 0.5 = half speed
+    // Small downscaled surface for motion estimation
+    const FLOW_W = 144; // lower = faster; higher = smoother
+    let FLOW_H = 96; // set after we know video aspect
+    const SEARCH_R = 4; // pixels of search radius on flow surface (±R)
+    const STEP = 2; // sample every 'STEP' pixels for speed
+    const ZOOM = 1.2; // overscan so shifts don't show edges
+    const MAX_QUEUE_FRAMES = 900; // safety cap (~15s at 60fps)
+    let speedFactor = 0.5; // slider-controlled: 1.0 normal, 0.5 half-speed
+
     const rate = document.getElementById("rate");
     const rateVal = document.getElementById("rateVal");
     rate.addEventListener("input", (e) => {
@@ -158,181 +160,169 @@
       rateVal.textContent = speedFactor.toFixed(2) + "×";
     });
 
-    let pxPerDegX = 0,
-      pxPerDegY = 0; // computed after we know video size
-    function computePxPerDeg(w, h) {
-      // Small-angle model: pixel shift ≈ f * theta(rad), f = (W/2)/tan(FOV/2)
-      const fX = w / 2 / Math.tan((H_FOV_DEG * Math.PI) / 180 / 2);
-      const fY = h / 2 / Math.tan((V_FOV_DEG * Math.PI) / 180 / 2);
-      pxPerDegX = fX * (Math.PI / 180);
-      pxPerDegY = fY * (Math.PI / 180);
+    let running = false;
+    let flowC = document.createElement("canvas");
+    let flowCtx = flowC.getContext("2d", { willReadFrequently: true });
+
+    let prevGray = null; // Uint8Array grayscale of previous flow frame
+    let grayA = null,
+      grayB = null; // two buffers we swap into
+    let scaleX = 1,
+      scaleY = 1; // map flow pixels -> video source pixels
+
+    // Motion delta queue and consumer
+    const deltaQ = []; // array of {dx, dy} (flow-space ints)
+    let consumeAcc = 0; // fractional consumer accumulator
+    let dispX = 0,
+      dispY = 0; // source-space pixels applied to draw
+
+    function setupSizes() {
+      const w = src.videoWidth,
+        h = src.videoHeight;
+      if (!w || !h) return false;
+      canvas.width = w;
+      canvas.height = h;
+
+      // Compute flow height keeping aspect
+      FLOW_H = Math.max(16, Math.round((FLOW_W * h) / w));
+      flowC.width = FLOW_W;
+      flowC.height = FLOW_H;
+
+      // flow pixel to source pixel scale
+      scaleX = w / FLOW_W;
+      scaleY = h / FLOW_H;
+
+      // allocate grayscale buffers
+      grayA = new Uint8Array(FLOW_W * FLOW_H);
+      grayB = new Uint8Array(FLOW_W * FLOW_H);
+      prevGray = null;
+      return true;
     }
 
-    /* === Gyro integration ====================================================== */
-    let haveMotion = false;
-    let yawDeg = 0,
-      pitchDeg = 0; // integrated rotation (degrees)
-    let lastMotionTS = null;
-
-    function onDeviceMotion(e) {
-      // rotationRate is deg/s
-      const rr = e.rotationRate || {};
-      const now = e.timeStamp || performance.now();
-      const dt =
-        lastMotionTS == null ? 0 : Math.max(0, (now - lastMotionTS) / 1000);
-      lastMotionTS = now;
-
-      // Axes mapping (best-effort; devices vary):
-      // alpha: z (twist), beta: x (pitch), gamma: y (roll). For "pan" feel,
-      // yaw-ish movement is mostly around Z/Y; vertical tilt is around X.
-      const alpha = rr.alpha || 0; // z
-      const beta = rr.beta || 0; // x
-      const gamma = rr.gamma || 0; // y
-
-      // Integrate. We treat yaw as mostly Z (alpha), pitch as X (beta).
-      yawDeg += alpha * dt;
-      pitchDeg += beta * dt;
-
-      haveMotion = true;
-    }
-
-    let useOrientationFallback = false;
-    let prevOri = { alpha: null, beta: null, gamma: null };
-    function onDeviceOrientation(e) {
-      // Fallback only if gyro not available/denied
-      if (!useOrientationFallback) return;
-      const { alpha, beta, gamma } = e; // degrees
-      const now = e.timeStamp || performance.now();
-      if (prevOri.alpha == null) {
-        prevOri = { alpha, beta, gamma, t: now };
-        return;
+    function toGrayscale(dst /*Uint8Array*/) {
+      const id = flowCtx.getImageData(0, 0, FLOW_W, FLOW_H).data;
+      // Integer luma approx: 0.299R + 0.587G + 0.114B ≈ (77R + 150G + 29B) >> 8
+      for (let i = 0, j = 0; i < id.length; i += 4, j++) {
+        dst[j] = (id[i] * 77 + id[i + 1] * 150 + id[i + 2] * 29) >> 8;
       }
-      const dt = Math.max(0, (now - prevOri.t) / 1000);
-      // Compute small deltas with wrap handling for alpha
-      const dAlpha = normDelta(alpha - prevOri.alpha);
-      const dBeta = normDelta(beta - prevOri.beta);
-      yawDeg += dAlpha;
-      pitchDeg += dBeta;
-      prevOri = { alpha, beta, gamma, t: now };
-    }
-    function normDelta(d) {
-      // map to [-180, 180]
-      if (d > 180) d -= 360;
-      else if (d < -180) d += 360;
-      return d;
     }
 
-    /* === Drawing (live, no buffering) ========================================= */
-    function drawLive() {
+    function estimateDelta(prev, curr) {
+      // Find dx,dy in [-SEARCH_R, SEARCH_R] that minimize SSD (sum of squared diff)
+      let bestDx = 0,
+        bestDy = 0,
+        bestScore = Infinity;
+      const w = FLOW_W,
+        h = FLOW_H;
+      const r = SEARCH_R,
+        step = STEP;
+      // Avoid borders by r to keep indices valid
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          let sum = 0,
+            cnt = 0;
+          for (let y = r; y < h - r; y += step) {
+            const y0 = y * w;
+            const y1 = (y + dy) * w;
+            for (let x = r; x < w - r; x += step) {
+              const i0 = y0 + x;
+              const i1 = y1 + (x + dx);
+              const d = curr[i1] - prev[i0];
+              sum += d * d;
+              cnt++;
+            }
+          }
+          // Normalize by cnt to reduce bias (optional)
+          const score = sum / (cnt || 1);
+          if (score < bestScore) {
+            bestScore = score;
+            bestDx = dx;
+            bestDy = dy;
+          }
+        }
+      }
+      // Clamp crazy jumps (optional, already bounded by SEARCH_R)
+      return { dx: bestDx, dy: bestDy };
+    }
+
+    function drawFrame() {
       if (!running) return;
+
       const w = src.videoWidth || 0,
         h = src.videoHeight || 0;
-      if (w && h && (canvas.width !== w || canvas.height !== h)) {
-        canvas.width = w;
-        canvas.height = h;
-        computePxPerDeg(w, h);
-      }
-      if (w && h) {
-        // Compensation = (1 - speedFactor) * integrated rotation → pixels
-        const compK = 1 - Math.max(0, Math.min(1, speedFactor));
-        let offX = -yawDeg * pxPerDegX * compK; // negative to oppose motion
-        let offY = -pitchDeg * pxPerDegY * compK;
-
-        // Clamp offsets to zoom margins
-        const marginX = (ZOOM - 1) * w * 0.5;
-        const marginY = (ZOOM - 1) * h * 0.5;
-        if (offX > marginX) offX = marginX;
-        if (offX < -marginX) offX = -marginX;
-        if (offY > marginY) offY = marginY;
-        if (offY < -marginY) offY = -marginY;
-
-        // Draw: overscanned frame shifted by (offX, offY)
-        try {
-          ctx.setTransform(1, 0, 0, 1, 0, 0); // reset
-          ctx.drawImage(
-            src,
-            -marginX + offX,
-            -marginY + offY,
-            w * ZOOM,
-            h * ZOOM
-          );
-        } catch {}
+      if (!w || !h) {
+        if ("requestVideoFrameCallback" in HTMLVideoElement.prototype)
+          src.requestVideoFrameCallback(() => drawFrame());
+        else requestAnimationFrame(drawFrame);
+        return;
       }
 
-      if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
-        src.requestVideoFrameCallback(() => drawLive());
-      } else {
-        requestAnimationFrame(drawLive);
+      // One-time setup when dimensions appear
+      if (canvas.width !== w || canvas.height !== h || flowC.width !== FLOW_W) {
+        setupSizes();
       }
+
+      // Produce motion delta (flow)
+      try {
+        flowCtx.drawImage(src, 0, 0, FLOW_W, FLOW_H);
+        // compute grayscale into grayA/grayB buffers, swap each frame
+        const curr = prevGray === grayA || prevGray === null ? grayB : grayA;
+        toGrayscale(curr);
+
+        if (prevGray) {
+          const { dx, dy } = estimateDelta(prevGray, curr);
+          // Push new delta; cap queue length
+          if (deltaQ.length >= MAX_QUEUE_FRAMES) deltaQ.shift();
+          deltaQ.push({ dx, dy });
+        }
+        prevGray = curr;
+      } catch (_) {
+        // ignore sporadic read errors
+      }
+
+      // Consume deltas at speedFactor of production
+      consumeAcc += speedFactor;
+      while (consumeAcc >= 1 && deltaQ.length) {
+        const { dx, dy } = deltaQ.shift();
+        dispX += dx * scaleX;
+        dispY += dy * scaleY;
+        consumeAcc -= 1;
+      }
+
+      // Clamp transform to zoom margins
+      const marginX = (ZOOM - 1) * w * 0.5;
+      const marginY = (ZOOM - 1) * h * 0.5;
+      if (dispX > marginX) dispX = marginX;
+      if (dispX < -marginX) dispX = -marginX;
+      if (dispY > marginY) dispY = marginY;
+      if (dispY < -marginY) dispY = -marginY;
+
+      // Draw current live frame with slowed transform applied
+      try {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(
+          src,
+          -marginX + dispX,
+          -marginY + dispY,
+          w * ZOOM,
+          h * ZOOM
+        );
+      } catch {}
+
+      if ("requestVideoFrameCallback" in HTMLVideoElement.prototype)
+        src.requestVideoFrameCallback(() => drawFrame());
+      else requestAnimationFrame(drawFrame);
     }
 
-    /* === Motion permission flow (iOS) ========================================= */
-    async function ensureMotionPermission() {
-      // Most Androids: already fine. iOS 13+: needs user gesture.
-      if (
-        typeof DeviceMotionEvent !== "undefined" &&
-        typeof DeviceMotionEvent.requestPermission === "function"
-      ) {
-        try {
-          const res = await DeviceMotionEvent.requestPermission();
-          if (res === "granted") {
-            window.addEventListener("devicemotion", onDeviceMotion, {
-              passive: true,
-            });
-            haveMotion = true;
-            return true;
-          }
-        } catch {}
-        return false;
-      } else {
-        // No special permission API; try listening directly
-        window.addEventListener("devicemotion", onDeviceMotion, {
-          passive: true,
-        });
-        // If nothing arrives, we’ll fallback to orientation
-        setTimeout(() => {
-          if (!haveMotion) {
-            useOrientationFallback = true;
-            window.addEventListener(
-              "deviceorientation",
-              onDeviceOrientation,
-              true
-            );
-          }
-        }, 1000);
-        return true;
-      }
-    }
-
-    /* === Startup / lifecycle =================================================== */
     async function startAll() {
       try {
         const stream = await getRearStream();
         src.srcObject = stream;
         await src.play();
         running = true;
-
-        // Motion permission
-        const motionOk = await ensureMotionPermission();
-        if (!motionOk) {
-          // Ask with overlay if blocked
-          const overlay = document.getElementById("tapToStart");
-          overlay.style.display = "grid";
-          overlay.onclick = async () => {
-            overlay.textContent = "Enabling motion…";
-            const granted = await ensureMotionPermission();
-            if (granted) {
-              overlay.style.display = "none";
-              drawLive();
-            } else {
-              overlay.textContent = "Motion blocked. Tap to retry.";
-            }
-          };
-        } else {
-          const overlay = document.getElementById("tapToStart");
-          if (overlay) overlay.style.display = "none";
-          drawLive();
-        }
+        const overlay = document.getElementById("tapToStart");
+        if (overlay) overlay.style.display = "none";
+        drawFrame();
       } catch (e) {
         console.error(e);
         const overlay = document.getElementById("tapToStart");
@@ -352,7 +342,7 @@
     // Pause/resume
     document.addEventListener("visibilitychange", () => {
       running = !document.hidden;
-      if (running) drawLive();
+      if (running) drawFrame();
     });
 
     // Cleanup
